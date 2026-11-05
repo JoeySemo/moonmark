@@ -1,0 +1,142 @@
+#  Supabase pauses Free-plan projects after about seven days without user
+#  database activity. A paused backend makes the app look empty rather than
+#  broken, which is the worst kind of outage: nobody reports it, they just
+#  assume the app does not work. This job is the cheapest insurance against
+#  that, and it runs in GitHub's cloud rather than on a laptop that might be
+#  shut for a week.
+#
+#  It is a workaround, not a fix. The fix is the Supabase Pro plan, which is
+#  never paused and also keeps daily backups of readers' progress — this job
+#  keeps the lights on but protects no data.
+#
+#  Two things worth knowing:
+#
+#  * GitHub disables scheduled workflows in a repository that has had no
+#    commits for 60 days, and tells you by email when it does. If this repo
+#    goes quiet for two months, this stops running silently-ish. Re-enable it
+#    from the Actions tab.
+#  * The run fails loudly on anything other than HTTP 200, so GitHub emails
+#    you. That makes this an uptime check as well as a keep-alive: if the
+#    project ever is paused, or the key is rotated, you hear about it the next
+#    morning instead of from a reviewer.
+
+name: Keep Supabase awake
+
+on:
+  schedule:
+    # 14:17 UTC daily. Deliberately not on the hour — GitHub's scheduler is
+    # busiest then and delays runs. A late run is fine; a dropped one is not.
+    - cron: '17 14 * * *'
+  workflow_dispatch:
+
+# Never run two of these at once, and let a manual run take priority over a
+# scheduled one that is still queued.
+concurrency:
+  group: keep-supabase-awake
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Query the database as a client would
+        env:
+          SUPABASE_URL: https://cojfgommjanjtebyeuvz.supabase.co
+          # This is a *publishable* key, not a secret one. Supabase issues it
+          # for exactly this: client-side use where anyone can read it. It is
+          # already compiled into the published iOS app, so anyone who wants
+          # it can pull it out of the binary — putting it in a public repo
+          # gives away nothing that is not already given away.
+          #
+          # What it can actually reach was checked rather than assumed:
+          # every content table returns zero rows through it, because those
+          # tables have row-level security with no select policy and are
+          # readable only through the SECURITY DEFINER functions that enforce
+          # the spoiler firewall. It can read `books` and `series`, which are
+          # a list of titles already printed on the App Store page.
+          #
+          # If you would still rather it were a secret, add
+          # SUPABASE_PUBLISHABLE_KEY under Settings > Secrets and variables >
+          # Actions and change the line below to
+          # ${{ secrets.SUPABASE_PUBLISHABLE_KEY }}. Nothing else changes.
+          #
+          # The service_role key must NEVER appear here. That one bypasses
+          # row-level security entirely and would hand over every table.
+          SUPABASE_KEY: sb_publishable_9iuHynH1P7TxgDkPJKG6SA_f9NKRry5
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SUPABASE_KEY}" ] || [ "${SUPABASE_KEY}" = "sb_publishable_PLACEHOLDER" ]; then
+            echo "::error::No Supabase key configured in this workflow."
+            exit 1
+          fi
+
+          # Supabase counts *user* requests, so this goes through the public
+          # REST API exactly as the app does. An internal pg_cron job would
+          # not count, which is the usual reason a keep-alive quietly fails.
+          #
+          # Several distinct queries rather than one: the documented threshold
+          # is "a few user requests to the database each day", and a single
+          # request a day sits uncomfortably close to that line.
+          fail=0
+
+          probe () {
+            local name="$1" method="$2" path="$3" body="${4:-}"
+            local code
+            if [ "$method" = "POST" ]; then
+              code=$(curl -sS -X POST -o /tmp/out -w '%{http_code}' \
+                "${SUPABASE_URL}${path}" \
+                -H "apikey: ${SUPABASE_KEY}" \
+                -H "Authorization: Bearer ${SUPABASE_KEY}" \
+                -H "Content-Type: application/json" \
+                -d "${body}")
+            else
+              code=$(curl -sS -o /tmp/out -w '%{http_code}' \
+                "${SUPABASE_URL}${path}" \
+                -H "apikey: ${SUPABASE_KEY}" \
+                -H "Authorization: Bearer ${SUPABASE_KEY}")
+            fi
+            local size
+            size=$(wc -c < /tmp/out | tr -d ' ')
+            printf '  %-28s HTTP %s  %s bytes\n' "$name" "$code" "$size"
+            if [ "$code" != "200" ]; then
+              echo "::error::${name} returned HTTP ${code}: $(head -c 400 /tmp/out)"
+              fail=1
+            fi
+          }
+
+          probe "series"     GET "/rest/v1/series?select=id,title&order=sequence_index"
+          probe "books"      GET "/rest/v1/books?select=id,abbreviation&limit=20"
+          cp /tmp/out /tmp/books.json
+
+          # Stop here if the basics already failed. Parsing the books response
+          # for a book id would otherwise throw a Python traceback over the
+          # top of the real diagnosis, which is the thing someone reading the
+          # failure email actually needs.
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Supabase did not respond normally. If the project is"
+            echo "::error::paused, resume it at https://supabase.com/dashboard"
+            exit 1
+          fi
+
+          # One real firewall call, so the thing the app actually depends on is
+          # the thing being exercised. A reachable table with a broken RPC is
+          # still a broken app.
+          #
+          # One line, not an indented block: `python3 -c` takes the leading
+          # whitespace of a YAML-indented script literally and dies on it.
+          book=$(python3 -c "import json;rows=json.load(open('/tmp/books.json'));print(next(r['id'] for r in rows if r['abbreviation']=='TOG'))")
+          probe "characters RPC" POST "/rest/v1/rpc/get_spoiler_free_characters_v2" \
+            "{\"positions\":[{\"book_id\":\"${book}\",\"chapter\":30}]}"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Supabase did not respond normally. If the project is"
+            echo "::error::paused, resume it at https://supabase.com/dashboard"
+            exit 1
+          fi
+
+          echo "Supabase is awake."
